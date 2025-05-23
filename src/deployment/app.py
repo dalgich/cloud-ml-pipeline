@@ -1,7 +1,5 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse
-from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import train_test_split
 from pydantic import BaseModel
 import numpy as np
 import joblib
@@ -11,14 +9,7 @@ from typing import List, Dict, Any, Optional
 from enum import Enum
 import io
 import os
-import sys
 from datetime import datetime
-
-# Add the project root to Python path
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(current_dir)
-sys.path.append(project_root)
-
 from utils.model_utils import MODEL_MAP, create_model, evaluate_model, save_model, load_model
 
 # Logging konfigürasyonu
@@ -39,6 +30,13 @@ class ModelType(str, Enum):
     SVM = "svm"
     XGB = "xgb"
     RANDOM_FOREST = "random_forest"
+
+# FastAPI uygulamasını oluştur
+app = FastAPI(
+    title="Dynamic ML Pipeline API",
+    description="Dinamik makine öğrenmesi pipeline'ı için REST API",
+    version="1.0.0"
+)
 
 def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
     """Veri setini ön işler ve kategorik değişkenleri dönüştürür"""
@@ -70,8 +68,12 @@ def detect_task_type(df: pd.DataFrame) -> TaskType:
         logger.error(f"Task tipi tespit edilirken hata oluştu: {str(e)}")
         raise HTTPException(status_code=400, detail="Veri seti formatı uygun değil")
 
-def find_best_model(df: pd.DataFrame, task_type: TaskType) -> Dict[str, Any]:
-    """Tüm modelleri test eder ve en iyi performans gösteren modeli seçer"""
+def train_model(
+    df: pd.DataFrame,
+    task_type: TaskType,
+    model_name: str
+) -> Dict[str, Any]:
+    """Veri setini kullanarak model eğitir"""
     try:
         # Veriyi ön işle
         df = preprocess_data(df)
@@ -83,76 +85,40 @@ def find_best_model(df: pd.DataFrame, task_type: TaskType) -> Dict[str, Any]:
         # Veriyi böl
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
         
-        best_model_name = None
-        best_metrics = None
-        best_score = float('-inf')
-        all_metrics = {}
+        # Model oluştur ve eğit
+        model = create_model(task_type, model_name)
+        model.fit(X_train, y_train)
         
-        # Her model için
-        for model_name in ModelType:
-            try:
-                logger.info(f"Testing model: {model_name}")
-                
-                # Model oluştur ve eğit
-                model = create_model(task_type, model_name)
-                model.fit(X_train, y_train)
-                
-                # Modeli değerlendir
-                metrics = evaluate_model(model, X_test, y_test, task_type)
-                all_metrics[model_name] = metrics
-                
-                # En iyi modeli güncelle
-                current_score = metrics.get('accuracy', metrics.get('r2', 0))
-                if current_score > best_score:
-                    best_score = current_score
-                    best_model_name = model_name
-                    best_metrics = metrics
-                
-                logger.info(f"Model {model_name} metrics: {metrics}")
-                
-            except Exception as e:
-                logger.error(f"Model {model_name} test edilirken hata oluştu: {str(e)}")
-                continue
+        # Modeli değerlendir
+        metrics = evaluate_model(model, X_test, y_test, task_type)
         
-        if best_model_name is None:
-            raise HTTPException(status_code=500, detail="Hiçbir model başarıyla test edilemedi")
-        
-        # En iyi modeli kaydet
-        best_model = create_model(task_type, best_model_name)
-        best_model.fit(X_train, y_train)
+        # Modeli kaydet
         version = datetime.now().strftime("%Y%m%d_%H%M%S")
-        model_path = save_model(best_model, task_type, best_model_name, version)
+        model_path = save_model(model, task_type, model_name, version)
         
+        logger.info(f"Model eğitildi ve kaydedildi. Metrikler: {metrics}")
         return {
-            "best_model": best_model_name,
-            "best_metrics": best_metrics,
-            "all_metrics": all_metrics,
             "model_path": model_path,
-            "version": version,
-            "model": best_model
+            "metrics": metrics,
+            "version": version
         }
         
     except Exception as e:
-        logger.error(f"Model seçimi sırasında hata oluştu: {str(e)}")
+        logger.error(f"Model eğitimi sırasında hata oluştu: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
-# FastAPI uygulamasını oluştur
-app = FastAPI(
-    title="Dynamic ML Pipeline API",
-    description="Dinamik makine öğrenmesi pipeline'ı için REST API",
-    version="1.0.0"
-)
 
 @app.post("/process_data")
 async def process_data(
     file: UploadFile = File(...),
-    mode: str = Form("predict")
+    mode: str = Form("predict"),
+    model_name: str = Form(None)
 ):
     """
     CSV dosyası yükler ve işler
     
     - **file**: CSV dosyası
     - **mode**: "train" (model eğitimi) veya "predict" (tahmin)
+    - **model_name**: Kullanılacak model adı (opsiyonel)
     """
     try:
         # CSV dosyasını oku
@@ -163,37 +129,55 @@ async def process_data(
         task_type = detect_task_type(df)
         logger.info(f"Tespit edilen task tipi: {task_type}")
         
-        # En iyi modeli bul
-        result = find_best_model(df, task_type)
+        # Model adını belirle
+        if model_name is None:
+            model_name = "random_forest"  # Varsayılan model
         
         if mode == "train":
+            # Model eğit
+            result = train_model(df, task_type, model_name)
             return JSONResponse(content={
                 "status": "success",
-                "message": "En iyi model seçildi ve eğitildi",
+                "message": "Model başarıyla eğitildi",
                 "task_type": task_type,
-                "best_model": result["best_model"],
+                "model_name": model_name,
                 "version": result["version"],
-                "best_metrics": result["best_metrics"],
-                "all_metrics": result["all_metrics"]
+                "metrics": result["metrics"]
             })
         else:
+            # En son modeli bul
+            model_dir = os.path.join("models", task_type, model_name)
+            if not os.path.exists(model_dir):
+                # Model yoksa eğit
+                result = train_model(df, task_type, model_name)
+                version = result["version"]
+            else:
+                # En son versiyonu bul
+                versions = [f.split(".")[0] for f in os.listdir(model_dir) if f.endswith(".joblib")]
+                version = max(versions)
+            
+            # Modeli yükle
+            model = load_model(task_type, model_name, version)
+            
+            # Veriyi ön işle
+            df = preprocess_data(df)
+            
             # Tahmin yap
             X = df.iloc[:, :-1].values
-            predictions = result["model"].predict(X)
+            predictions = model.predict(X)
             
             # Classification için olasılıkları hesapla
             confidence = None
-            if task_type == TaskType.CLASSIFICATION and hasattr(result["model"], "predict_proba"):
-                confidence = result["model"].predict_proba(X).max(axis=1).tolist()
+            if task_type == TaskType.CLASSIFICATION and hasattr(model, "predict_proba"):
+                confidence = model.predict_proba(X).max(axis=1).tolist()
             
             return JSONResponse(content={
                 "status": "success",
                 "task_type": task_type,
-                "model_name": result["best_model"],
-                "version": result["version"],
+                "model_name": model_name,
+                "version": version,
                 "predictions": predictions.tolist(),
-                "confidence": confidence,
-                "model_metrics": result["best_metrics"]
+                "confidence": confidence
             })
             
     except Exception as e:
@@ -208,4 +192,4 @@ async def process_data(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8003) 
+    uvicorn.run(app, host="0.0.0.0", port=8001) 
